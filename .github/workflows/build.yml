@@ -1,0 +1,322 @@
+name: Build Flutter Android - Myket + Adivery
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Extract Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "pubspec.yaml" ]; then
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ZIP_COUNT="$(find . -maxdepth 1 -type f -name "*.zip" | wc -l | tr -d ' ')"
+
+          if [ "$ZIP_COUNT" = "0" ]; then
+            echo "ERROR: No zip file found in repository root."
+            exit 1
+          fi
+
+          if [ "$ZIP_COUNT" != "1" ]; then
+            echo "ERROR: More than one zip file found in repository root."
+            echo "Keep only one zip file in the repository root."
+            find . -maxdepth 1 -type f -name "*.zip"
+            exit 1
+          fi
+
+          ZIP_FILE="$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)"
+          echo "Using zip file: $ZIP_FILE"
+
+          rm -rf extracted_project
+          mkdir -p extracted_project
+          unzip -q "$ZIP_FILE" -d extracted_project
+
+          PUBSPEC_PATH="$(find extracted_project -name pubspec.yaml -type f | head -n 1 || true)"
+
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "ERROR: pubspec.yaml not found after extracting zip file."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC_PATH")"
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Prepare Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter --version
+          flutter config --no-analytics
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android --org com.miplus --project-name mashghorboon .
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Configure Android package, signing and R8 fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 .github/scripts/configure_android.py
+
+      - name: Patch Gradle repositories for Myket and Adivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          GROOVY_REPOS = '''repositories {
+              google()
+              mavenCentral()
+              gradlePluginPortal()
+              maven { url 'https://storage.googleapis.com/download.flutter.io' }
+              maven { url 'https://jitpack.io' }
+              maven { url 'https://maven.adivery.com' }
+          }'''
+
+          KTS_REPOS = '''repositories {
+              google()
+              mavenCentral()
+              gradlePluginPortal()
+              maven { url = uri("https://storage.googleapis.com/download.flutter.io") }
+              maven { url = uri("https://jitpack.io") }
+              maven { url = uri("https://maven.adivery.com") }
+          }'''
+
+          def remove_repository_mode(text: str) -> str:
+              return re.sub(r'\s*repositoriesMode\.set\(RepositoriesMode\.[^)]+\)\s*', '\n', text)
+
+          def block_bounds(text: str, start_idx: int):
+              open_idx = text.find('{', start_idx)
+              if open_idx < 0:
+                  return None
+              depth = 0
+              for i in range(open_idx, len(text)):
+                  if text[i] == '{':
+                      depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return open_idx, i
+              return None
+
+          def replace_repositories_blocks(text: str, kts: bool) -> str:
+              replacement = KTS_REPOS if kts else GROOVY_REPOS
+              starts = [m.start() for m in re.finditer(r'(?m)(^|\n)\s*repositories\s*\{', text)]
+              if not starts:
+                  return text
+              result = []
+              last = 0
+              for start in starts:
+                  bounds = block_bounds(text, start)
+                  if not bounds:
+                      continue
+                  _open, end = bounds
+                  result.append(text[last:start])
+                  prefix = re.match(r'\s*', text[start:]).group(0)
+                  indented = '\n'.join((prefix + line if line.strip() else line) for line in replacement.splitlines())
+                  result.append(indented)
+                  last = end + 1
+              result.append(text[last:])
+              return ''.join(result)
+
+          def remove_myket_repo(text: str) -> str:
+              text = re.sub(r'\n?\s*maven\s*\{[^{}]*maven\.myket\.ir[^{}]*\}', '', text, flags=re.S)
+              lines = [line for line in text.splitlines() if 'maven.myket.ir' not in line]
+              return '\n'.join(lines) + ('\n' if text.endswith('\n') else '')
+
+          def ensure_repositories(text: str, kts: bool) -> str:
+              text = remove_repository_mode(text)
+              text = remove_myket_repo(text)
+              text = text.replace('jcenter()', 'mavenCentral()')
+              if 'repositories' in text:
+                  text = replace_repositories_blocks(text, kts)
+              else:
+                  replacement = KTS_REPOS if kts else GROOVY_REPOS
+                  text = text.rstrip() + "\n\nallprojects {\n    " + replacement.replace('\n', '\n    ') + "\n}\n"
+              return text
+
+          def patch_gradle_file(path: Path, kts: bool, namespace=None) -> None:
+              if not path.exists():
+                  return
+              text = path.read_text(encoding='utf-8')
+              original = text
+              text = ensure_repositories(text, kts)
+              if namespace and ('namespace ' not in text and 'namespace =' not in text):
+                  if kts:
+                      text = re.sub(r'android\s*\{', 'android {\n    namespace = "' + namespace + '"', text, count=1)
+                  else:
+                      text = re.sub(r'android\s*\{', 'android {\n    namespace "' + namespace + '"', text, count=1)
+              if text != original:
+                  path.write_text(text, encoding='utf-8')
+                  print('Patched:', path)
+              else:
+                  print('OK:', path)
+
+          def patch_app_gradle(path: Path, kts: bool) -> None:
+              if not path.exists():
+                  return
+              text = path.read_text(encoding='utf-8')
+              original = text
+              text = remove_repository_mode(text)
+              text = remove_myket_repo(text)
+              if kts:
+                  if 'marketApplicationId' not in text:
+                      placeholder = (
+                          'manifestPlaceholders["marketApplicationId"] = "ir.mservices.market"\\n'
+                          '            manifestPlaceholders["marketBindAddress"] = "ir.mservices.market.InAppBillingService.BIND"\\n'
+                          '            manifestPlaceholders["marketPermission"] = "ir.mservices.market.BILLING"'
+                      )
+                      text = re.sub(r'(defaultConfig\s*\{)', r'\1\n            ' + placeholder, text, count=1)
+                  if 'jvmToolchain(21)' not in text:
+                      insert = '\n\n    kotlin {\n        jvmToolchain(21)\n    }\n'
+                      text = text.replace('\n    buildTypes {', insert + '\n    buildTypes {', 1)
+              else:
+                  if 'marketApplicationId' not in text:
+                      placeholder = (
+                          'def marketApplicationId = "ir.mservices.market"\\n'
+                          '            def marketBindAddress = "ir.mservices.market.InAppBillingService.BIND"\\n'
+                          '            manifestPlaceholders += [marketApplicationId: "${marketApplicationId}",\\n'
+                          '                    marketBindAddress  : "${marketBindAddress}",\\n'
+                          '                    marketPermission   : "${marketApplicationId}.BILLING"]'
+                      )
+                      text = re.sub(r'(defaultConfig\s*\{)', r'\1\n            ' + placeholder, text, count=1)
+                  if 'jvmToolchain(21)' not in text:
+                      insert = '\n\n    kotlin {\n        jvmToolchain(21)\n    }\n'
+                      text = text.replace('\n    buildTypes {', insert + '\n    buildTypes {', 1)
+              if text != original:
+                  path.write_text(text, encoding='utf-8')
+                  print('Patched app gradle:', path)
+              else:
+                  print('App gradle OK:', path)
+
+          android = Path('android')
+          patch_gradle_file(android / 'settings.gradle.kts', True)
+          patch_gradle_file(android / 'settings.gradle', False)
+          patch_gradle_file(android / 'build.gradle.kts', True)
+          patch_gradle_file(android / 'build.gradle', False)
+          patch_app_gradle(android / 'app' / 'build.gradle.kts', True)
+          patch_app_gradle(android / 'app' / 'build.gradle', False)
+
+          roots = []
+          for raw in (os.environ.get('PUB_CACHE'), str(Path.home() / '.pub-cache')):
+              if raw and Path(raw).exists() and Path(raw) not in roots:
+                  roots.append(Path(raw))
+
+          plugin_files = []
+          for root in roots:
+              plugin_files.extend(root.glob('hosted/**/myket_iap-*/android/build.gradle'))
+              plugin_files.extend(root.glob('hosted/**/myket_iap-*/android/build.gradle.kts'))
+              plugin_files.extend(root.glob('hosted/**/adivery-*/android/build.gradle'))
+              plugin_files.extend(root.glob('hosted/**/adivery-*/android/build.gradle.kts'))
+              plugin_files.extend(root.glob('hosted/**/audioplayers_android-*/android/build.gradle'))
+              plugin_files.extend(root.glob('hosted/**/audioplayers_android-*/android/build.gradle.kts'))
+
+          if not plugin_files:
+              raise SystemExit('No plugin Gradle files found in pub cache.')
+
+          for file in sorted(set(plugin_files)):
+              name = str(file)
+              namespace = None
+              if 'myket_iap-' in name:
+                  namespace = 'ir.mservices.myket_iap'
+              elif 'adivery-' in name:
+                  namespace = 'com.adivery.plugin'
+              elif 'audioplayers_android-' in name:
+                  namespace = 'xyz.luan.audioplayers'
+              patch_gradle_file(file, file.name.endswith('.kts'), namespace)
+
+          offenders = []
+          candidates = list(android.rglob('*.gradle')) + list(android.rglob('*.gradle.kts')) + plugin_files
+          for file in candidates:
+              if file.exists() and 'maven.myket.ir' in file.read_text(encoding='utf-8', errors='ignore'):
+                  offenders.append(str(file))
+          if offenders:
+              raise SystemExit('maven.myket.ir still found:\n' + '\n'.join(offenders))
+          PY
+
+      - name: Generate and force Android launcher icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          dart run flutter_launcher_icons
+          python3 -m pip install --user pillow
+          python3 .github/scripts/force_android_launcher_icon.py
+
+      - name: Analyze project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze || true
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build apk --release --no-shrink
+
+      - name: Build AAB
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build appbundle --release --no-shrink
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: myket-adivery-app-release-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: myket-adivery-app-release-aab
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
